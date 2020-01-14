@@ -1,2 +1,2 @@
-# ChineseHeadlineEditing
-importance aware learning for neural headline editing
+# Importance-Aware Learning for Neural Headline Editing
+
