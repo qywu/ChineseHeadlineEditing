@@ -10,5 +10,4 @@ Please check the requirements first
 ##
 
 
-Please use this bibtex if you want to cite this repository in your publications:
 
