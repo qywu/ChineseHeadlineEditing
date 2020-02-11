@@ -1,7 +1,7 @@
 import os
 import torchfly
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["OMP_NUM_THREADS"] = "1"
 torchfly.set_random_seed(123)
 
 import time
@@ -28,14 +28,12 @@ from torchfly.modules.losses import SequenceFocalLoss, SequenceCrossEntropyLoss
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-a", "--alpha", type=float, help="SIA alpha")
-parser.add_argument("-b", "--beta",  type=float, help="SIA alpha")
+parser.add_argument("-b", "--beta", type=float, help="SIA alpha")
 parser.add_argument("-o", "--output_dir", help="SIA alpha", default="results")
 args = parser.parse_args()
 
-
 # put it at the start of the file
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                    level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 create_serialization_dir(Params({"seed": 123}), args.output_dir, recover=False, force=True)
@@ -166,11 +164,10 @@ batch_size = 5
 train_dataset = SIAHeadlineDataset(train_data)
 val_dataset = SIAHeadlineDataset(val_data)
 
-train_dataloader = DataLoader(dataset=train_dataset, shuffle=True,
-                              batch_size=batch_size, collate_fn=mod_collate, num_workers=16)
-val_dataloader = DataLoader(dataset=val_dataset, shuffle=False,
-                            batch_size=batch_size, collate_fn=mod_collate)
-
+train_dataloader = DataLoader(
+    dataset=train_dataset, shuffle=True, batch_size=batch_size, collate_fn=mod_collate, num_workers=16
+)
+val_dataloader = DataLoader(dataset=val_dataset, shuffle=False, batch_size=batch_size, collate_fn=mod_collate)
 
 # alpha_beta = [(0.0, 0.0),
 #               (-1.0, 0.0),
@@ -188,7 +185,6 @@ b = args.beta
 encoder = TransformerModel(unidirectional=False)
 decoder = TransformerLMHeadModel()
 
-
 logger.info(f"Start training of alpha={a} beta={b}")
 
 states = torch.load("../TSP/TSP-best.th")
@@ -202,22 +198,25 @@ decoder = decoder.to(device)
 
 num_epochs = 10
 num_gradients_accumulation = 1
-num_train_optimization_steps = num_train_optimization_steps = len(train_dataset) * num_epochs // batch_size // num_gradients_accumulation
+num_train_optimization_steps = len(train_dataset) * num_epochs // batch_size // num_gradients_accumulation
 
 param_optimizer = list(encoder.named_parameters()) + list(decoder.named_parameters())
 no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 optimizer_grouped_parameters = [
-    {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
-    {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    {
+        'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+        'weight_decay': 0.01
+    }, {
+        'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+        'weight_decay': 0.0
+    }
 ]
 
-optimizer = AdamW(optimizer_grouped_parameters,
-                    lr=1e-5,
-                    correct_bias=False)
+optimizer = AdamW(optimizer_grouped_parameters, lr=1e-5, correct_bias=False)
 
-scheduler = WarmupLinearSchedule(optimizer,
-                                    warmup_steps=int(num_train_optimization_steps*0.1),
-                                    t_total=num_train_optimization_steps)
+scheduler = WarmupLinearSchedule(
+    optimizer, warmup_steps=int(num_train_optimization_steps * 0.1), t_total=num_train_optimization_steps
+)
 
 [encoder, decoder], optimizer = amp.initialize([encoder, decoder], optimizer, opt_level='O1')
 
@@ -248,17 +247,18 @@ for ep in range(5):
             start = end
 
             pb.set_postfix(loss=record_loss, perplexity=perplexity, speed=speed)
-        
 
     "Evaluation"
     encoder.eval()
     decoder.eval()
     ppl = validate(val_dataloader)
-    checkpointer.save_checkpoint(str(ep),
-                                    {"encoder": encoder.state_dict(), "decoder": decoder.state_dict()},
-                                    {"empty": None},
-                                    is_best_so_far=True)
-    
+    checkpointer.save_checkpoint(
+        str(ep), {
+            "encoder": encoder.state_dict(),
+            "decoder": decoder.state_dict()
+        }, {"empty": None},
+        is_best_so_far=True
+    )
 
     logger.info(f"a={a} b={b} Epoch {ep} Validation perplexity: {ppl}")
 

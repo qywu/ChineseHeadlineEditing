@@ -3,8 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import torchfly
-from torchfly.text.decode import top_filtering
+from torchfly.text.decode import top_k_top_p_filtering
 from typing import List, Union, Dict
+import numpy as np
 
 # pylint: disable=no-member
 
@@ -19,15 +20,15 @@ class DefaultDecodingConfig:
     temperature = 0.9
     top_k = -1
     top_p = 0.9
-    retition_penalty = 1.0
+    repetition_penalty = 1.0
     length_penalty = 1.0
     eos_token_ids = []
-    bos_token_id = None
+    bos_token_ids = []
     pad_token_id = None
 
 
-class DecodingHelper:
-    def __init__(self, model, device=None, decode_config=None):
+class TransformerDecodingHelper:
+    def __init__(self, model, device, decode_config=None):
         self.config = decode_config if decode_config else DefaultDecodingConfig
         self.device = device
         self.model = model
@@ -43,7 +44,7 @@ class DecodingHelper:
         top_k: int = None,
         top_p: float = None,
         repetition_penalty=None,
-        bos_token_id=None,
+        bos_token_ids=None,
         pad_token_id=None,
         eos_token_ids=None,
         length_penalty=None,
@@ -64,12 +65,14 @@ class DecodingHelper:
             temperature: (`optional`) float
                 The value used to module the next token probabilities. Must be strictely positive. Default to 1.0.
             top_k: (`optional`) int
-                The number of highest probability vocabulary tokens to keep for top-k-filtering. Between 1 and infinity. Default to 50.
+                The number of highest probability vocabulary tokens to keep for top-k-filtering. Between 1 and infinity. 
+                Default to 50.
             top_p: (`optional`) float
-                The cumulative probability of parameter highest probability vocabulary tokens to keep for nucleus sampling. Must be between 0 and 1. Default to 1.
+                The cumulative probability of parameter highest probability vocabulary tokens to keep for nucleus sampling. 
+                Must be between 0 and 1. Default to 1.
             repetition_penalty: (`optional`) float
                 The parameter for repetition penalty. Between 1.0 and infinity. 1.0 means no penalty. Default to 1.0.
-            bos_token_id: (`optional`) int
+            bos_token_ids: (`optional`) int
                 Beginning of sentence token if no prompt is provided. Default to 0.
             eos_token_ids: (`optional`) int or list of int
                 End of sequence token or list of tokens to stop the generation. Default to 0.
@@ -78,12 +81,6 @@ class DecodingHelper:
             num_return_sequences: (`optional`) int
                 The number of independently computed returned sequences for each element in the batch. Default to 1.
         """
-        # We cannot generate if the model does not have a LM head
-        # if self.get_output_embeddings() is None:
-        #     raise AttributeError(
-        #         "You tried to generate sequences with a model that does not have a LM Head."
-        #         "Please use another model class (e.g. `OpenAIGPTLMHeadModel`, `XLNetLMHeadModel`, `GPT2LMHeadModel`, `CTRLLMHeadModel`, `T5WithLMHeadModel`, `TransfoXLLMHeadModel`)"
-        #     )
 
         # setup the configuration
         self.config.max_length = (max_length if max_length is not None else self.config.max_length)
@@ -95,7 +92,7 @@ class DecodingHelper:
         self.config.repetition_penalty = (
             repetition_penalty if repetition_penalty is not None else self.config.repetition_penalty
         )
-        self.config.bos_token_id = (bos_token_id if bos_token_id is not None else self.config.bos_token_id)
+        self.config.bos_token_ids = (bos_token_ids if bos_token_ids is not None else self.config.bos_token_ids)
         self.config.pad_token_id = (pad_token_id if pad_token_id is not None else self.config.pad_token_id)
         self.config.eos_token_ids = (eos_token_ids if eos_token_ids is not None else self.config.eos_token_ids)
         self.config.length_penalty = (length_penalty if length_penalty is not None else self.config.length_penalty)
@@ -117,7 +114,7 @@ class DecodingHelper:
         if input_ids is None:
             input_ids = torch.full(
                 (batch_size, 1),
-                bos_token_id,
+                bos_token_ids,
                 dtype=torch.long,
                 device=self.device,
             )
@@ -182,20 +179,37 @@ class DecodingHelper:
     def prepare_inputs_for_generation(self):
         return {}
 
-    def _generate_no_beam_search(self, start_input_ids: torch.Tensor, states: Dict) -> Dict[str, List]:
+    def _generate_no_beam_search(self, start_input_ids: torch.Tensor,
+                                 states: Dict[str, torch.Tensor]) -> Dict[str, List]:
         """ Generate sequences for each example without beam search (num_beams == 1).
             All returned sequence are generated independantly.
             Efficient generation is implemented.
+        Parameters:
+            start_input_ids: the start input tensor, If start_input_ids is varied length, please change states accordingly.
+            states["position_ids"]: position ids for start_input_ids
+            states["mask"]: mask for start_input_ids and past
+            states["past"]: history key-value pairs in Transformer
+        Returns:
+            results["tokens"]: the generated tokens in lists
+            results["log_probs"]: the log probabilities of generated tokens
         """
+        batch_size = start_input_ids.shape[0]
+
         # record the index of each sequence for pop out
-        sequence_indices = {i for i in range(self.config.batch_size)}
-        token_sequences = {i: [self.config.bos_token_id] for i in range(self.config.batch_size)}
-        log_prob_sequences = {i: [0.0] for i in range(self.config.batch_size)}
+        sequence_indices = {i for i in range(batch_size)}
+        token_sequences = {i: start_input_ids[i].tolist() for i in range(batch_size)}
+        log_prob_sequences = {i: [0.0] * start_input_ids[i].shape[0] for i in range(batch_size)}
+
+        # extract information from states
+        next_token = start_input_ids
+        next_position_id = states["position_ids"]
+        past = states["past"]
+        mask = states["mask"]
 
         # main generation loop
         for cur_len in range(self.config.max_length):
             # generate next token
-            next_token_logits, past = self.model(**states)
+            next_token_logits, past = self.model(next_token, mask=mask, position_ids=next_position_id, past=past)
             next_token_logits = next_token_logits[:, -1, :]
             next_token_log_probs = torch.log_softmax(next_token_logits, dim=-1)
 
@@ -214,7 +228,9 @@ class DecodingHelper:
                 # Temperature (higher temperature => more likely to sample low probability tokens)
                 next_token_logits = next_token_logits / self.config.temperature
                 # Top-p/top-k filtering
-                next_token_logits = top_filtering(next_token_logits, top_k=self.config.top_k, top_p=self.config.top_p)
+                next_token_logits = top_k_top_p_filtering(
+                    next_token_logits, top_k=self.config.top_k, top_p=self.config.top_p
+                )
                 # Sample
                 next_token = torch.multinomial(F.softmax(next_token_logits, dim=-1), num_samples=1)
             else:
@@ -229,13 +245,13 @@ class DecodingHelper:
             # first add all the tokens to sequences
             for i, seq_idx in enumerate(sequence_indices):
                 token_sequences[seq_idx].append(next_token_list[i])
-                log_prob_sequences.append(next_token_log_probs_list[i])
+                log_prob_sequences[seq_idx].append(next_token_log_probs_list[i])
 
             # then pop finished sequences
             pop_flag = False
             nonpop_indices = []
             for i, seq_idx in enumerate(sequence_indices):
-                if len(token_sequences[seq_idx]) >= self.config.eos_token_ids:
+                if len(token_sequences[seq_idx]) >= len(self.config.eos_token_ids):
                     # if match eos patterns
                     if (token_sequences[seq_idx][-len(self.config.eos_token_ids):] == self.config.eos_token_ids):
                         sequence_indices.remove(seq_idx)
@@ -256,122 +272,141 @@ class DecodingHelper:
             if len(sequence_indices) == 0:
                 break
 
+            # prepare for the next loop
+            # past = past
+            mask = F.pad(mask, (0, 1), "constant", 1.0)
+            next_position_id = next_position_id[:, -1].unsqueeze(1) + 1
+
         # add eos_token_ids to unfinished sentences
         if cur_len == (self.config.max_length - 1):
             for seq_idx in sequence_indices:
                 token_sequences[seq_idx].extend(self.config.eos_token_ids)
                 log_prob_sequences[seq_idx].extend([0.0 for _ in range(len(self.config.eos_token_ids))])
 
-        return token_sequences, log_prob_sequences
+        results = {
+            "tokens": [item for item in token_sequences.values()],
+            "log_probs": [item for item in log_prob_sequences.values()]
+        }
 
-    def _assertion_check(self):
-        assert (
-            isinstance(self.config.max_length, int) and self.config.max_length > 0
-        ), "`max_length` should be a strictely positive integer."
-        assert isinstance(self.config.do_sample, bool), "`do_sample` should be a boolean."
-        assert (
-            isinstance(self.config.num_beams, int) and self.config.num_beams > 0
-        ), "`num_beams` should be a strictely positive integer."
-        assert (self.config.temperature > 0), "`temperature` should be strictely positive."
-        assert (isinstance(self.config.top_k, int) and self.config.top_k >= 0), "`top_k` should be a positive integer."
-        assert 0 <= self.config.top_p <= 1, "`top_p` should be between 0 and 1."
-        assert (self.config.repetition_penalty >= 1.0), "`repetition_penalty` should be >= 1."
-        assert (
-            isinstance(self.config.bos_token_id, int) and self.config.bos_token_id >= 0
-        ), "`bos_token_id` should be a positive integer."
-        assert (
-            isinstance(self.config.pad_token_id, int) and self.config.pad_token_id >= 0
-        ), "`pad_token_id` should be a positive integer."
-        assert isinstance(self.config.eos_token_ids, (list, tuple)) and (
-            e >= 0 for e in self.config.eos_token_ids
-        ), "`eos_token_ids` should be a positive integer or a list/tuple of positive integers."
-        assert (self.config.length_penalty > 0), "`length_penalty` should be strictely positive."
-        assert (
-            isinstance(self.config.num_return_sequences, int) and self.config.num_return_sequences > 0
-        ), "`num_return_sequences` should be a strictely positive integer."
+        return results
 
-    def _generate_beam_search(
-        self,
-        start_input_ids,
-    ):
+    def _generate_beam_search(self, start_input_ids: torch.Tensor, states: Dict[str, torch.Tensor],
+                              num_beams: int) -> Dict[str, List]:
+        """ Generate sequences for each example without beam search (num_beams == 1).
+            All returned sequence are generated independantly.
+            Efficient generation is implemented.
+        Parameters:
+            start_input_ids: the start input tensor, If start_input_ids is varied length, please change states accordingly.
+            states["position_ids"]: position ids for start_input_ids
+            states["mask"]: mask for start_input_ids and past
+            states["past"]: history key-value pairs in Transformer
+        Returns:
+            results["tokens"]: the generated tokens in lists
+            results["log_probs"]: the log probabilities of generated tokens
+        """
         """ Generate sequences for each example with beam search.
         """
-        # Expand input to num beams
-        next_position_id = 0
+        batch_size = start_input_ids.shape[0]
 
-        # (batch_size * num_beams, cur_len)
+        # record the index of each sequence for pop out
+        sequence_indices = {i for i in range(self.config.batch_size)}
+        token_sequences = {i: start_input_ids[i].tolist() for i in range(self.config.batch_size)}
+        log_prob_sequences = {i: [0.0] * len() for i in range(self.config.batch_size)}
 
-        input_ids = start_input_ids.unsqueeze(1).expand(
-            start_input_ids.shape[0], self.config.num_beams, start_input_ids.shape[1]
+        # extract information from states
+        next_token = start_input_ids
+        next_position_id = states["position_ids"]
+        past = states["past"]
+        mask = states["mask"]
+
+        # shape: (batch_size * num_beams, cur_len)
+        start_input_ids = start_input_ids.unsqueeze(1).expand(
+            start_input_ids.shape[0], num_beams, start_input_ids.shape[1]
         )
-        input_ids = input_ids.contiguous().view(
-            start_input_ids.shape[0] * self.config.num_beams, start_input_ids.shape[1]
+        start_input_ids = start_input_ids.contiguous().view(
+            start_input_ids.shape[0] * num_beams, start_input_ids.shape[1]
         )
 
         # generated hypotheses
         generated_hyps = [
-            BeamHypotheses(
-                self.config.num_beams, self.config.max_length, self.config.length_penalty, early_stopping=False
-            ) for _ in range(self.config.batch_size)
+            BeamHypotheses(num_beams, self.config.max_length, self.config.length_penalty, early_stopping=False)
+            for _ in range(self.config.batch_size)
         ]
 
         # scores for each sentence in the beam
-        beam_scores = torch.zeros(
-            (self.config.batch_size, self.config.num_beams), dtype=torch.float, device=start_input_ids.device
-        )
-        beam_scores[:, 1:] = -1e5
+        beam_scores = torch.zeros((batch_size, self.config.num_beams), dtype=torch.float, device=start_input_ids.device)
+        beam_scores[:, 1:] = -np.Inf
         beam_scores = beam_scores.view(-1)  # shape (batch_size * num_beams,)
 
-        # cache compute states
-        past = None
-
         # done sentences
-        done = [False for _ in range(self.config.batch_size)]
+        done = [False for _ in range(batch_size)]
 
         for cur_len in range(self.config.max_length):
-            model_inputs = self.prepare_inputs_for_generation(input_ids, past=past)
-            outputs = self(**model_inputs)  # (batch_size * num_beams, cur_len, vocab_size)
-            scores = outputs[0][:, -1, :]  # (batch_size * num_beams, vocab_size)
+            # generate next token
+            next_token_logits, past = self.model(next_token, mask=mask, position_ids=next_position_id, past=past)
+            next_token_logits = next_token_logits[:, -1, :]
+            next_token_log_probs = torch.log_softmax(next_token_logits, dim=-1)
+            # shape: (batch_size * num_beams, vocab_size)
+            scores = next_token_logits
 
-            # if model has past, then set the past variable to speed up decoding
-            if self._do_output_past(outputs):
-                past = outputs[1]
+            # model_inputs = self.prepare_inputs_for_generation(input_ids, past=past)
+            # outputs = self(**model_inputs)  # (batch_size * num_beams, cur_len, vocab_size)
+            # scores = outputs[0][:, -1, :]  # (batch_size * num_beams, vocab_size)
 
-            # repetition penalty (from CTRL paper https://arxiv.org/abs/1909.05858)
+            # # repetition penalty (from CTRL paper https://arxiv.org/abs/1909.05858)
+            # if self.config.repetition_penalty != 1.0:
+            #     for i in range(self.config.batch_size * self.config.num_beams):
+            #         for previous_token in set(input_ids[i].tolist()):
+            #             # if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
+            #             if scores[i, previous_token] < 0:
+            #                 scores[i, previous_token] *= self.config.repetition_penalty
+            #             else:
+            #                 scores[i, previous_token] /= self.config.repetition_penalty
+
+            # repetition penalty from CTRL paper (https://arxiv.org/abs/1909.05858)
             if self.config.repetition_penalty != 1.0:
-                for i in range(self.config.batch_size * self.config.num_beams):
-                    for previous_token in set(input_ids[i].tolist()):
-                        # if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
-                        if scores[i, previous_token] < 0:
-                            scores[i, previous_token] *= self.config.repetition_penalty
+                for i, seq_idx in enumerate(sequence_indices):
+                    for previous_token in set(token_sequences[seq_idx]):
+                        # if score < 0 then repetition penalty has to be multiplied to reduce the previous
+                        # token probability
+                        if next_token_logits[i, previous_token] < 0:
+                            next_token_logits[i, previous_token] *= self.config.repetition_penalty
                         else:
-                            scores[i, previous_token] /= self.config.repetition_penalty
+                            next_token_logits[i, previous_token] /= self.config.repetition_penalty
 
             if self.config.do_sample:
                 # Temperature (higher temperature => more likely to sample low probability tokens)
-                if temperature != 1.0:
-                    scores = scores / temperature
+                if self.config.temperature != 1.0:
+                    scores = scores / self.config.temperature
                 # Top-p/top-k filtering
                 scores = top_k_top_p_filtering(
-                    scores, top_k=top_k, top_p=top_p, min_tokens_to_keep=2
-                )  # (batch_size * num_beams, vocab_size)
+                    scores, top_k=self.config.top_k, top_p=self.config.top_p, min_tokens_to_keep=2
+                )
+
+                # (batch_size * num_beams, vocab_size)
                 # Sample 2 next words for each beam (so we have some spare tokens and match output of greedy beam search)
                 next_words = torch.multinomial(F.softmax(scores, dim=-1), num_samples=2)  # (batch_size * num_beams, 2)
+
                 # Compute next scores
                 _scores = F.log_softmax(scores, dim=-1)  # (batch_size * num_beams, vocab_size)
                 _scores = torch.gather(_scores, -1, next_words)  # (batch_size * num_beams, 2)
                 next_scores = _scores + beam_scores[:, None].expand_as(_scores)  # (batch_size * num_beams, 2)
+
                 # Match shape of greedy beam search
                 next_words = next_words.view(batch_size, 2 * num_beams)  # (batch_size, 2 * num_beams)
                 next_scores = next_scores.view(batch_size, 2 * num_beams)  # (batch_size, 2 * num_beams)
             else:
                 # do greedy beam search
                 scores = F.log_softmax(scores, dim=-1)  # (batch_size * num_beams, vocab_size)
-                assert scores.size() == (batch_size * num_beams, vocab_size)
-                # Add the log prob of the new beams to the log prob of the beginning of the sequence (sum of logs == log of the product)
+
+                # Add the log prob of the new beams to the log prob of the beginning of the sequence
+                # (sum of logs == log of the product)
                 _scores = scores + beam_scores[:, None].expand_as(scores)  # (batch_size * num_beams, vocab_size)
+
                 # re-organize to group the beam together (we are keeping top hypothesis accross beams)
-                _scores = _scores.view(batch_size, num_beams * vocab_size)  # (batch_size, num_beams * vocab_size)
+                _scores = _scores.view(
+                    batch_size, num_beams * self.config.vocab_size
+                )  # (batch_size, num_beams * vocab_size)
                 next_scores, next_words = torch.topk(_scores, 2 * num_beams, dim=1, largest=True, sorted=True)
 
             assert next_scores.size() == next_words.size() == (batch_size, 2 * num_beams)
@@ -385,8 +420,9 @@ class DecodingHelper:
 
                 # if we are done with this sentence
                 done[batch_ex] = done[batch_ex] or generated_hyps[batch_ex].is_done(next_scores[batch_ex].max().item())
+
                 if done[batch_ex]:
-                    next_batch_beam.extend([(0, pad_token_id, 0)] * num_beams)  # pad the batch
+                    next_batch_beam.extend([(0, self.config.pad_token_id, 0)] * num_beams)  # pad the batch
                     continue
 
                 # next sentence beam content
@@ -396,11 +432,11 @@ class DecodingHelper:
                 for idx, score in zip(next_words[batch_ex], next_scores[batch_ex]):
 
                     # get beam and word IDs
-                    beam_id = idx // vocab_size
-                    word_id = idx % vocab_size
+                    beam_id = idx // self.config.vocab_size
+                    word_id = idx % self.config.vocab_size
 
                     # end of sentence, or next word
-                    if word_id.item() in eos_token_ids or cur_len + 1 == max_length:
+                    if word_id.item() in self.config.eos_token_ids or cur_len + 1 == self.config.max_length:
                         generated_hyps[batch_ex].add(
                             input_ids[batch_ex * num_beams + beam_id, :cur_len].clone(), score.item()
                         )
@@ -412,14 +448,15 @@ class DecodingHelper:
                         break
 
                 # update next beam content
-                assert len(next_sent_beam) == 0 if cur_len + 1 == max_length else num_beams
+                assert len(next_sent_beam) == 0 if cur_len + 1 == self.config.max_length else num_beams
                 if len(next_sent_beam) == 0:
-                    next_sent_beam = [(0, pad_token_id, 0)] * num_beams  # pad the batch
+                    next_sent_beam = [(0, self.config.pad_token_id, 0)] * num_beams  # pad the batch
                 next_batch_beam.extend(next_sent_beam)
                 assert len(next_batch_beam) == num_beams * (batch_ex + 1)
 
             # sanity check / prepare next batch
             assert len(next_batch_beam) == batch_size * num_beams
+
             beam_scores = beam_scores.new([x[0] for x in next_batch_beam])
             beam_words = input_ids.new([x[1] for x in next_batch_beam])
             beam_idx = input_ids.new([x[2] for x in next_batch_beam])
@@ -440,9 +477,6 @@ class DecodingHelper:
                     assert reordered_layer_past.shape == layer_past.shape
                     reordered_past.append(reordered_layer_past)
                 past = tuple(reordered_past)
-
-            # update current length
-            cur_len = cur_len + 1
 
             # stop when we are done with each sentence
             if all(done):
@@ -467,15 +501,41 @@ class DecodingHelper:
             best.append(best_hyp)
 
         # generate target batch
-        decoded = input_ids.new(batch_size, tgt_len.max().item()).fill_(pad_token_id)
+        decoded = input_ids.new(batch_size, tgt_len.max().item()).fill_(self.config.pad_token_id)
         for i, hypo in enumerate(best):
             decoded[i, :tgt_len[i] - 1] = hypo
-            decoded[i, tgt_len[i] - 1] = eos_token_ids[0]
+            decoded[i, tgt_len[i] - 1] = self.config.eos_token_ids[0]
 
         return decoded
 
+    def _assertion_check(self):
+        assert (
+            isinstance(self.config.max_length, int) and self.config.max_length > 0
+        ), "`max_length` should be a strictely positive integer."
+        assert isinstance(self.config.do_sample, bool), "`do_sample` should be a boolean."
+        assert (
+            isinstance(self.config.num_beams, int) and self.config.num_beams > 0
+        ), "`num_beams` should be a strictely positive integer."
+        assert (self.config.temperature > 0), "`temperature` should be strictely positive."
+        assert (isinstance(self.config.top_k, int) and self.config.top_k >= 0), "`top_k` should be a positive integer."
+        assert 0 <= self.config.top_p <= 1, "`top_p` should be between 0 and 1."
+        assert (self.config.repetition_penalty >= 1.0), "`repetition_penalty` should be >= 1."
+        assert (
+            isinstance(self.config.pad_token_id, int) and self.config.pad_token_id >= 0
+        ), "`pad_token_id` should be a positive integer."
+        assert isinstance(self.config.eos_token_ids, (list, tuple)) and (
+            e >= 0 for e in self.config.eos_token_ids
+        ), "`eos_token_ids` should be a positive integer or a list/tuple of positive integers."
+        assert (self.config.length_penalty > 0), "`length_penalty` should be strictely positive."
+        assert (
+            isinstance(self.config.num_return_sequences, int) and self.config.num_return_sequences > 0
+        ), "`num_return_sequences` should be a strictely positive integer."
+        # assert (isinstance(self.config.bos_token_ids, int)
+        #         and self.config.bos_token_ids >= 0
+        #         ), "`bos_token_ids` should be a positive integer."
 
-class BeamHypotheses(object):
+
+class BeamHypotheses:
     def __init__(self, n_hyp, max_length, length_penalty, early_stopping):
         """
         Initialize n-best list of hypotheses.
@@ -485,7 +545,7 @@ class BeamHypotheses(object):
         self.early_stopping = early_stopping
         self.n_hyp = n_hyp
         self.hyp = []
-        self.worst_score = 1e9
+        self.worst_score = np.Inf
 
     def __len__(self):
         """
