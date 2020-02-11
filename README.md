@@ -36,4 +36,17 @@ Or you can download [PHED](https://drive.google.com/file/d/1UOtCsk9JfO-lSdV9jaeI
 
 ## Training
 
-See `/notebooks/Train PAS.ipynb` 
+See `/notebooks/Train PAS.ipynb`
+
+## Released Weights
+
+[Final PAS weights](https://drive.google.com/file/d/1WOnV6xMAvokd-aOBTehxHeojz91OiJkl/view?usp=sharing)
+
+[After Adaptation weights](https://drive.google.com/file/d/1nG_V1tVTNgabLo95yy7PIBH-4zpo7ji1/view?usp=sharing)
+
+## Chinese GPT
+
+[Chinese GPT weights](https://drive.google.com/file/d/1agi64d06PlBe6XUz2IMkgl8ZKjw6H7nS/view?usp=sharing)
+
+We will later try to upload to huggingface's custom model repo. For now, you can try google colab example: https://colab.research.google.com/drive/1cvBSt2uF7hYL1feDGt0dkCxIeaVXQs5x
+
